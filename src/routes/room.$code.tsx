@@ -289,7 +289,18 @@ function Room({ code, name }: { code: string; name: string }) {
         xhr.setRequestHeader("apikey", import.meta.env['VITE_SUPABASE_PUBLISHABLE_KEY']);
         xhr.setRequestHeader("content-type", file.type || "video/x-matroska");
         xhr.upload.onprogress = (ev) => ev.lengthComputable && setProgress(Math.round((ev.loaded / ev.total) * 100));
-        xhr.onload = () => (xhr.status < 300 ? resolve() : reject(new Error("Upload failed")));
+        xhr.onload = () => {
+          if (xhr.status < 300) return resolve();
+          let detail = "";
+          try { detail = JSON.parse(xhr.responseText)?.message ?? ""; } catch { detail = xhr.responseText?.slice(0, 120) ?? ""; }
+          if (xhr.status === 413 || /exceeded the maximum allowed size/i.test(detail)) {
+            reject(new Error("File is too big for your Supabase storage limit (free plan max is 50 MB)"));
+          } else if (/mime type/i.test(detail)) {
+            reject(new Error("Bucket blocks this file type — clear 'allowed MIME types' on the room-videos bucket"));
+          } else {
+            reject(new Error(`Upload failed (${xhr.status}) ${detail}`.trim()));
+          }
+        };
         xhr.onerror = () => reject(new Error("Upload failed — check your connection"));
         xhr.send(file);
       });
