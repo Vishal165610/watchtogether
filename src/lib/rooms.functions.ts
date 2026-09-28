@@ -49,6 +49,7 @@ export const getRoom = createServerFn({ method: "POST" })
     }
     return {
       exists: true as const,
+      videoPath: room.video_path as string | null,
       videoUrl,
       videoName: room.video_name,
       videoType: room.video_type,
@@ -105,3 +106,4 @@ export const closeRoom = createServerFn({ method: "POST" })
     await db.from("rooms").delete().eq("code", data.code);
     return { ok: true };
   });
+  

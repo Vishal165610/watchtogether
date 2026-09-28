@@ -8,6 +8,7 @@ type Props = {
   onPause: () => void;
   onSeeked: () => void;
   onError: () => void;
+  onReady?: () => void;
   chat: ReactNode;
   unread: number;
   onChatOpenChange: (open: boolean) => void;
@@ -20,7 +21,7 @@ function fmt(s: number) {
   return (h ? `${h}:${String(m).padStart(2, "0")}` : `${m}`) + `:${String(sec).padStart(2, "0")}`;
 }
 
-export function WatchPlayer({ src, videoRef, onPlay, onPause, onSeeked, onError, chat, unread, onChatOpenChange, lastMessage }: Props) {
+export function WatchPlayer({ src, videoRef, onPlay, onPause, onSeeked, onError, onReady, chat, unread, onChatOpenChange, lastMessage }: Props) {
   const wrap = useRef<HTMLDivElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -36,6 +37,12 @@ export function WatchPlayer({ src, videoRef, onPlay, onPause, onSeeked, onError,
   const rippleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => { onChatOpenChange(chatOpen); }, [chatOpen, onChatOpenChange]);
+
+  useEffect(() => () => {
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    if (tapTimer.current) clearTimeout(tapTimer.current);
+    if (rippleTimer.current) clearTimeout(rippleTimer.current);
+  }, []);
 
   useEffect(() => {
     const f = () => setFs(!!document.fullscreenElement);
@@ -67,7 +74,8 @@ export function WatchPlayer({ src, videoRef, onPlay, onPause, onSeeked, onError,
   function skip(d: number, side: "l" | "r") {
     const v = videoRef.current;
     if (!v) return;
-    v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + d));
+    const max = isFinite(v.duration) ? v.duration : Infinity;
+    v.currentTime = Math.max(0, Math.min(max, v.currentTime + d));
     setRipple((r) => ({ side, n: r && r.side === side ? r.n + 10 : 10 }));
     if (rippleTimer.current) clearTimeout(rippleTimer.current);
     rippleTimer.current = setTimeout(() => setRipple(null), 700);
@@ -131,7 +139,7 @@ export function WatchPlayer({ src, videoRef, onPlay, onPause, onSeeked, onError,
         onSeeked={onSeeked}
         onError={onError}
         onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
-        onLoadedMetadata={(e) => setDur(e.currentTarget.duration)}
+        onLoadedMetadata={(e) => { setDur(e.currentTarget.duration); onReady?.(); }}
         onDurationChange={(e) => setDur(e.currentTarget.duration)}
       />
 
@@ -169,7 +177,7 @@ export function WatchPlayer({ src, videoRef, onPlay, onPause, onSeeked, onError,
           <input
             type="range"
             min={0}
-            max={dur || 0}
+            max={isFinite(dur) ? dur : 0}
             step={0.1}
             value={time}
             onChange={(e) => { const v = videoRef.current; if (v) v.currentTime = Number(e.target.value); bump(); }}

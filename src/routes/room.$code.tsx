@@ -26,6 +26,7 @@ export const Route = createFileRoute("/room/$code")({
 
 type Msg = { id: string; from: string; name: string; text: string; at: number };
 type Peer = { id: string; name: string; typing: boolean };
+type SyncPayload = { action: "play" | "pause" | "seek" | "tick"; time: number; paused: boolean };
 
 function RoomPage() {
   const { code } = Route.useParams();
@@ -74,7 +75,7 @@ function Room({ code, name }: { code: string; name: string }) {
   const [me] = useState(() => crypto.randomUUID());
   const [hostSecret, setHostSecret] = useState<string | null>(null);
   const [status, setStatus] = useState<"loading" | "ok" | "gone">("loading");
-  const [video, setVideo] = useState<{ url: string; name: string } | null>(null);
+  const [video, setVideo] = useState<{ path: string; url: string; name: string } | null>(null);
   const [progress, setProgress] = useState<number | null>(null);
   const [messages, setMessages] = useState<Msg[]>([]);
   const [peers, setPeers] = useState<Peer[]>([]);
@@ -82,10 +83,13 @@ function Room({ code, name }: { code: string; name: string }) {
 
   const channelRef = useRef<RealtimeChannel | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const suppress = useRef(false);
+  // Echo guards: when we apply a remote action, the matching local media event must not be re-broadcast.
+  const applying = useRef({ play: 0, pause: 0, seek: 0 });
+  const controller = useRef(false); // true if this device last drove playback (sends heartbeats)
+  const pendingSync = useRef<SyncPayload | null>(null);
+  const seekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const typingRef = useRef(false);
-  const chatEnd = useRef<HTMLDivElement | null>(null);
   const [fsChatOpen, setFsChatOpen] = useState(false);
   const [seenCount, setSeenCount] = useState(0);
   const onFsChat = useCallback((o: boolean) => setFsChatOpen(o), []);
@@ -96,22 +100,63 @@ function Room({ code, name }: { code: string; name: string }) {
   }, [incomingCount, fsChatOpen]);
 
   const load = useCallback(async () => {
-    const r = await fetchRoom({ data: { code } });
-    if (!r.exists) return setStatus("gone");
-    setStatus("ok");
-    setVideo(r.videoUrl ? { url: r.videoUrl, name: r.videoName ?? "Video" } : null);
+    try {
+      const r = await fetchRoom({ data: { code } });
+      if (!r.exists) return setStatus("gone");
+      setStatus("ok");
+      // Keep the same object (and URL) while the file is unchanged, so the player never remounts needlessly.
+      setVideo((prev) => {
+        if (!r.videoUrl || !r.videoPath) return null;
+        if (prev && prev.path === r.videoPath) return prev;
+        return { path: r.videoPath, url: r.videoUrl, name: r.videoName ?? "Video" };
+      });
+    } catch (e) {
+      toast.error((e as Error).message || "Couldn't load the room");
+      setStatus((s) => (s === "loading" ? "gone" : s));
+    }
   }, [code, fetchRoom]);
+  const loadRef = useRef(load);
+  loadRef.current = load;
 
   useEffect(() => {
     setHostSecret(localStorage.getItem(`duet-host-${code}`));
     load();
-  }, [code, load]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code]);
+
+  function applySync(p: SyncPayload) {
+    const v = videoRef.current;
+    if (!v || v.readyState < 1) {
+      pendingSync.current = p; // video not ready yet; apply on loadedmetadata
+      return;
+    }
+    controller.current = false;
+    const guard = (k: "play" | "pause" | "seek") => { applying.current[k] = Date.now() + 2500; };
+    const threshold = p.action === "tick" ? 1.5 : 0.5;
+    if (Math.abs(v.currentTime - p.time) > threshold) {
+      guard("seek");
+      v.currentTime = p.time;
+    }
+    if (p.paused && !v.paused) {
+      guard("pause");
+      v.pause();
+    } else if (!p.paused && v.paused) {
+      guard("play");
+      v.play().catch(() => {
+        applying.current.play = 0;
+        toast("Tap play to join your partner");
+      });
+    }
+  }
+  const applySyncRef = useRef(applySync);
+  applySyncRef.current = applySync;
 
   // Realtime: chat, presence (online + typing), playback sync
   useEffect(() => {
     if (status !== "ok") return;
     const ch = supabase.channel(`duet-${code}`, { config: { presence: { key: me }, broadcast: { self: false } } });
     channelRef.current = ch;
+    let wasDown = false;
 
     ch.on("presence", { event: "sync" }, () => {
       const state = ch.presenceState<{ name: string; typing: boolean }>();
@@ -122,46 +167,87 @@ function Room({ code, name }: { code: string; name: string }) {
       .on("presence", { event: "join" }, ({ key, newPresences }) => {
         if (key !== me) toast(`${(newPresences[0] as unknown as { name: string })?.name ?? "Someone"} joined`);
       })
-      .on("broadcast", { event: "chat" }, ({ payload }) => setMessages((m) => [...m, payload as Msg]))
-      .on("broadcast", { event: "video" }, () => load())
-      .on("broadcast", { event: "closed" }, () => setStatus("gone"))
-      .on("broadcast", { event: "sync" }, ({ payload }) => {
-        const v = videoRef.current;
-        if (!v) return;
-        const p = payload as { action: "play" | "pause" | "seek"; time: number };
-        suppress.current = true;
-        if (Math.abs(v.currentTime - p.time) > 0.5) v.currentTime = p.time;
-        if (p.action === "play") v.play().catch(() => toast("Tap play to join your partner"));
-        if (p.action === "pause") v.pause();
-        setTimeout(() => (suppress.current = false), 400);
+      .on("broadcast", { event: "chat" }, ({ payload }) => {
+        const m = payload as Msg;
+        setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m].slice(-300)));
       })
+      .on("broadcast", { event: "video" }, () => loadRef.current())
+      .on("broadcast", { event: "closed" }, () => setStatus("gone"))
+      .on("broadcast", { event: "sync" }, ({ payload }) => applySyncRef.current(payload as SyncPayload))
       .on("broadcast", { event: "sync-request" }, () => {
         const v = videoRef.current;
-        if (!v || !v.src) return;
-        ch.send({ type: "broadcast", event: "sync", payload: { action: v.paused ? "pause" : "play", time: v.currentTime } });
+        if (!v || v.readyState < 1) return;
+        ch.send({ type: "broadcast", event: "sync", payload: { action: "tick", time: v.currentTime, paused: v.paused } satisfies SyncPayload });
       })
       .subscribe(async (s) => {
         if (s === "SUBSCRIBED") {
-          await ch.track({ name, typing: false });
+          try { await ch.track({ name, typing: false }); } catch { /* ignore */ }
           ch.send({ type: "broadcast", event: "sync-request", payload: {} });
+          if (wasDown) { wasDown = false; loadRef.current(); }
+        } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT" || s === "CLOSED") {
+          wasDown = true;
         }
       });
 
+    // Re-sync after the tab/app returns from background (mobile browsers drop sockets)
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      ch.track({ name, typing: false }).catch(() => {});
+      ch.send({ type: "broadcast", event: "sync-request", payload: {} });
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
+    // Heartbeat: whoever last drove playback keeps the other side from drifting
+    const beat = setInterval(() => {
+      const v = videoRef.current;
+      if (!controller.current || !v || v.paused || v.readyState < 2) return;
+      ch.send({ type: "broadcast", event: "sync", payload: { action: "tick", time: v.currentTime, paused: false } satisfies SyncPayload });
+    }, 3000);
+
     return () => {
+      clearInterval(beat);
+      document.removeEventListener("visibilitychange", onVisible);
       supabase.removeChannel(ch);
       channelRef.current = null;
     };
-  }, [status, code, me, name, load]);
+  }, [status, code, me, name]);
 
   useEffect(() => {
-    chatEnd.current?.scrollIntoView({ behavior: "smooth" });
+    document.querySelectorAll("[data-chat-end]").forEach((el) => el.scrollIntoView({ block: "nearest" }));
   }, [messages, peers]);
 
+  useEffect(() => () => {
+    if (seekTimer.current) clearTimeout(seekTimer.current);
+    if (typingTimer.current) clearTimeout(typingTimer.current);
+  }, []);
+
   function sendSync(action: "play" | "pause" | "seek") {
-    if (suppress.current) return;
     const v = videoRef.current;
     if (!v) return;
-    channelRef.current?.send({ type: "broadcast", event: "sync", payload: { action, time: v.currentTime } });
+    channelRef.current?.send({ type: "broadcast", event: "sync", payload: { action, time: v.currentTime, paused: v.paused } satisfies SyncPayload });
+  }
+
+  function onLocalEvent(kind: "play" | "pause" | "seek") {
+    // Ignore events that were caused by applying a remote action (consume once)
+    if (Date.now() < applying.current[kind]) {
+      applying.current[kind] = 0;
+      return;
+    }
+    controller.current = true;
+    if (kind === "seek") {
+      // Dragging the seek bar fires many events; send only the final one
+      if (seekTimer.current) clearTimeout(seekTimer.current);
+      seekTimer.current = setTimeout(() => sendSync("seek"), 250);
+    } else {
+      sendSync(kind);
+    }
+  }
+
+  function onPlayerReady() {
+    const p = pendingSync.current;
+    pendingSync.current = null;
+    if (p) applySync(p);
+    else channelRef.current?.send({ type: "broadcast", event: "sync-request", payload: {} });
   }
 
   function setTyping(t: boolean) {
@@ -277,7 +363,7 @@ function Room({ code, name }: { code: string; name: string }) {
             {typers.map((t) => t.name).join(", ")} is typing…
           </div>
         )}
-        <div ref={chatEnd} />
+        <div data-chat-end />
       </div>
       <form onSubmit={sendMsg} className="flex gap-2 border-t p-3">
         <Input value={text} onChange={(e) => onType(e.target.value)} placeholder={others.length ? "Message…" : "Waiting for your partner…"} className="h-11" />
@@ -334,12 +420,13 @@ function Room({ code, name }: { code: string; name: string }) {
           )}
           {video ? (
             <WatchPlayer
-              key={video.url}
+              key={video.path}
               src={video.url}
               videoRef={videoRef}
-              onPlay={() => sendSync("play")}
-              onPause={() => sendSync("pause")}
-              onSeeked={() => sendSync("seek")}
+              onPlay={() => onLocalEvent("play")}
+              onPause={() => onLocalEvent("pause")}
+              onSeeked={() => onLocalEvent("seek")}
+              onReady={onPlayerReady}
               onError={() => toast.error("This device can't play this video format")}
               chat={chatPanel}
               unread={unread}
